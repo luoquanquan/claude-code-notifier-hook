@@ -1,5 +1,5 @@
 {
-  "name": "claude-code-notifier",
+  "name": "claude-code-notifier-hook",
   "version": "1.0.0",
   "description": "Claude Code Stop hook notifier — sends a system notification when Claude finishes a task",
   "main": "index.js",
