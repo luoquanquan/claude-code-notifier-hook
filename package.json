@@ -1,0 +1,27 @@
+{
+  "name": "claude-code-notifier",
+  "version": "1.0.0",
+  "description": "Claude Code Stop hook notifier — sends a system notification when Claude finishes a task",
+  "main": "index.js",
+  "bin": {
+    "claude-code-notifier-hook": "./bin/claude-code-notifier-hook.js"
+  },
+  "scripts": {
+    "test": "echo \"No tests configured\" && exit 0"
+  },
+  "keywords": [
+    "claude-code",
+    "notifier",
+    "hook",
+    "notification"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "inquirer": "^8.2.6",
+    "node-notifier": "^10.0.1"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "claude-code-notifier-hook notify --sound lailalaodi --custom-sound",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
