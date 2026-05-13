@@ -29,6 +29,9 @@ if (subcommand === 'init') {
   });
 } else if (subcommand === 'notify') {
   runNotify(rest);
+} else if (subcommand === '_send') {
+  // 内部命令：由后台 debounce 进程调用，实际执行通知
+  sendNow(rest);
 } else {
   console.log('用法:');
   console.log('  claude-code-notifier-hook init     初始化配置');
@@ -36,7 +39,7 @@ if (subcommand === 'init') {
   process.exit(0);
 }
 
-// ─── init ───��────────────────────────────────────────────────────────────────
+// ─── init ────────────────────────────────────────────────────────────────────
 
 async function runInit() {
   const inquirer = require('inquirer');
@@ -168,7 +171,6 @@ async function runInit() {
 // ─── notify ──────────────────────────────────────────────────────────────────
 
 function runNotify(args) {
-  // 读取 stdin（Stop hook 的 JSON 输入）
   let input = {};
   try {
     const raw = fs.readFileSync('/dev/stdin', 'utf-8');
@@ -180,19 +182,54 @@ function runNotify(args) {
   // ⚠️ 防止无限循环
   if (input.stop_hook_active === true) process.exit(0);
 
-  // 解析 --sound / --custom-sound
+  // Debounce：防止 auto-compact 等中途 stop 触发误报。
+  // 写入唯一 token，后台等待 N 秒后检查 token 是否仍是最新；
+  // 若期间有新 stop 触发（覆盖了 token），则跳过本次通知。
+  const debounceIdx = args.indexOf('--debounce');
+  const debounceSec = debounceIdx !== -1 ? (parseInt(args[debounceIdx + 1]) || 5) : 5;
+
+  const stateFile = path.join(os.tmpdir(), 'claude-notifier-token');
+  const token = `${Date.now()}.${process.pid}`;
+
+  try { fs.writeFileSync(stateFile, token); } catch { process.exit(0); }
+
+  // 传递音效参数给后台发送进程（过滤掉 --debounce 及其值）
+  const soundArgs = [];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--debounce') { i++; continue; }
+    soundArgs.push(args[i]);
+  }
+
+  // 每个参数单引号包裹，内部单引号转义，防止音效名含特殊字符时 bash 解析错误
+  const quotedArgs = soundArgs.map(a => `'${a.replace(/'/g, "'\\''")}'`).join(' ');
+
+  const bgScript = [
+    `sleep ${debounceSec}`,
+    `stored=$(cat "${stateFile}" 2>/dev/null)`,
+    `[ "$stored" = "${token}" ] && node "${__filename}" _send ${quotedArgs}`,
+  ].join('\n');
+
+  try {
+    spawn('bash', ['-c', bgScript], { detached: true, stdio: 'ignore' }).unref();
+  } catch { /* ignore */ }
+
+  process.exit(0);
+}
+
+// ─── _send（内部）────────────────────────────────────────────────────────────
+
+function sendNow(args) {
   const soundIdx = args.indexOf('--sound');
   const soundName = soundIdx !== -1 ? args[soundIdx + 1] : null;
   const isCustomSound = args.includes('--custom-sound');
 
-  // 发送系统通知
   try {
     const notifier = require('node-notifier');
     notifier.notify({
       title: '🤖 提醒',
       message: 'Claude Code 任务完成，请继续...',
-      sound: !soundName,  // 无自定义音时使用系统默认通知音
-      wait: true,
+      sound: !soundName,
+      wait: false,
     });
     if (soundName) playSound(soundName, isCustomSound);
   } catch {
