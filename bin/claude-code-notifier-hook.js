@@ -2,8 +2,9 @@
 
 // claude-code-notifier-hook.js — Claude Code Notifier
 // 用法:
-//   claude-code-notifier-hook init            — 交互式配置向导
-//   claude-code-notifier-hook notify [opts]   — 由 Claude Code Stop hook 自动调用
+//   claude-code-notifier-hook init              — 交互式配置向导
+//   claude-code-notifier-hook notify [opts]     — 由 Claude Code Stop hook 自动调用
+//   claude-code-notifier-hook attention-notify  — 由 PreToolUse hook 自动调用（需要决策时）
 
 const fs = require('fs');
 const path = require('path');
@@ -29,13 +30,14 @@ if (subcommand === 'init') {
   });
 } else if (subcommand === 'notify') {
   runNotify(rest);
+} else if (subcommand === 'attention-notify') {
+  runAttentionNotify(rest);
 } else if (subcommand === '_send') {
-  // 内部命令：由后台 debounce 进程调用，实际执行通知
   sendNow(rest);
 } else {
   console.log('用法:');
   console.log('  claude-code-notifier-hook init     初始化配置');
-  console.log('  claude-code-notifier-hook notify   发送通知（由 Claude Code 自动调用）');
+  console.log('  claude-code-notifier-hook notify   发送通知（由 Claude Code Stop hook 调用）');
   process.exit(0);
 }
 
@@ -54,7 +56,7 @@ async function runInit() {
       message: '将 hook 安装到哪个级别？',
       choices: [
         { name: '用户级别 (~/.claude/settings.json)', value: 'user' },
-        { name: '项目级别 (.claude/settings.json)', value: 'project' }
+        { name: '项目级别 (.claude/settings.local.json，不提交 git)', value: 'project' }
       ]
     }
   ]);
@@ -107,12 +109,28 @@ async function runInit() {
     console.log('ℹ️  当前系统暂不支持自定义提示音，将使用默认通知。');
   }
 
-  // 3. 确定配置文件路径
+  // 3. 是否启用"需要决策时提醒"（PreToolUse hook）
+  const { enableAttentionNotify } = await inquirer.prompt([
+    {
+      type: 'confirm',
+      name: 'enableAttentionNotify',
+      message: '当 Claude Code 需要您做决策时（如弹出交互对话框）是否同步发送提醒？',
+      default: true
+    }
+  ]);
+
+  // 4. 确定配置文件路径
+  // 项目级别使用 settings.local.json，不会提交 git，避免影响其他开发者
   const configPath = installLevel === 'user'
     ? path.join(os.homedir(), '.claude', 'settings.json')
-    : path.join(process.cwd(), '.claude', 'settings.json');
+    : path.join(process.cwd(), '.claude', 'settings.local.json');
 
-  // 4. 读取现有配置
+  // 5. 项目级别：确保 settings.local.json 在 .gitignore 中
+  if (installLevel === 'project') {
+    ensureGitignored(path.join(process.cwd(), '.gitignore'), '.claude/settings.local.json');
+  }
+
+  // 6. 读取现有配置
   let config = {};
   if (fs.existsSync(configPath)) {
     try {
@@ -122,21 +140,18 @@ async function runInit() {
     }
   }
 
-  // 5. 构建 hook 命令
-  const baseCommand = `claude-code-notifier-hook notify${soundArg}`;
-  const hookCommand = installLevel === 'user'
-    ? `[ -f .claude/settings.json ] && grep -q 'claude-code-notifier-hook' .claude/settings.json || ${baseCommand}`
-    : baseCommand;
-
-  // 6. 合并 hooks 配置
   if (!config.hooks) config.hooks = {};
   if (!config.hooks.Stop) config.hooks.Stop = [];
 
-  const alreadyAdded = config.hooks.Stop.some(entry =>
-    (entry.hooks || []).some(h => h.command && h.command.includes('claude-code-notifier-hook'))
+  // 7. 检查是否已存在配置
+  const stopExists = config.hooks.Stop.some(entry =>
+    (entry.hooks || []).some(h => h.command?.includes('claude-code-notifier-hook notify'))
+  );
+  const attentionExists = (config.hooks.PreToolUse || []).some(entry =>
+    (entry.hooks || []).some(h => h.command?.includes('claude-code-notifier-hook attention-notify'))
   );
 
-  if (alreadyAdded) {
+  if (stopExists || attentionExists) {
     const { overwrite } = await inquirer.prompt([
       {
         type: 'confirm',
@@ -150,25 +165,64 @@ async function runInit() {
       process.exit(0);
     }
     config.hooks.Stop = config.hooks.Stop.filter(entry =>
-      !(entry.hooks || []).some(h => h.command && h.command.includes('claude-code-notifier-hook'))
+      !(entry.hooks || []).some(h => h.command?.includes('claude-code-notifier-hook notify'))
     );
+    if (config.hooks.PreToolUse) {
+      config.hooks.PreToolUse = config.hooks.PreToolUse.filter(entry =>
+        !(entry.hooks || []).some(h => h.command?.includes('claude-code-notifier-hook attention-notify'))
+      );
+    }
   }
 
+  // 8. 构建并写入 Stop hook
+  const baseCommand = `claude-code-notifier-hook notify${soundArg}`;
+  // 用户级别：用 grep 检查两个可能的项目级配置文件，避免与项目级 hook 重复触发
+  const stopCommand = installLevel === 'user'
+    ? `grep -ql 'claude-code-notifier-hook' .claude/settings.json .claude/settings.local.json 2>/dev/null || ${baseCommand}`
+    : baseCommand;
+
   config.hooks.Stop.push({
-    hooks: [{ type: 'command', command: hookCommand, timeout: 10 }]
+    hooks: [{ type: 'command', command: stopCommand, timeout: 10 }]
   });
 
-  // 7. 写入配置
+  // 9. 写入 PreToolUse hook（需要决策时提醒）
+  if (enableAttentionNotify) {
+    if (!config.hooks.PreToolUse) config.hooks.PreToolUse = [];
+    const attentionCommand = `claude-code-notifier-hook attention-notify${soundArg}`;
+    config.hooks.PreToolUse.push({
+      matcher: 'AskUserQuestion',
+      hooks: [{ type: 'command', command: attentionCommand, timeout: 5 }]
+    });
+  }
+
+  // 10. 写入配置文件
   const configDir = path.dirname(configPath);
   if (!fs.existsSync(configDir)) fs.mkdirSync(configDir, { recursive: true });
   fs.writeFileSync(configPath, JSON.stringify(config, null, 2), 'utf-8');
 
   console.log(`\n✅ 配置已写入: ${configPath}`);
-  console.log(`   Hook 命令: ${hookCommand}`);
-  console.log('\n下次 Claude Code 完成任务时将自动发送通知。\n');
+  console.log(`   Stop hook: ${stopCommand}`);
+  if (enableAttentionNotify) {
+    console.log(`   PreToolUse hook (AskUserQuestion): claude-code-notifier-hook attention-notify${soundArg}`);
+  }
+  console.log('\n下次 Claude Code 完成任务或需要您决策时将自动发送通知。\n');
 }
 
-// ─── notify ──────────────────────────────────────────────────────────────────
+function ensureGitignored(gitignorePath, entry) {
+  try {
+    const existing = fs.existsSync(gitignorePath)
+      ? fs.readFileSync(gitignorePath, 'utf-8')
+      : '';
+    if (existing.split('\n').some(line => line.trim() === entry)) return;
+    const suffix = existing.endsWith('\n') ? '' : '\n';
+    fs.appendFileSync(gitignorePath, `${suffix}# Claude Code 本地配置（个人，不提交）\n${entry}\n`);
+    console.log(`✅ 已将 ${entry} 添加到 .gitignore`);
+  } catch {
+    console.warn(`⚠️  无法更新 .gitignore，请手动添加 ${entry}`);
+  }
+}
+
+// ─── notify（Stop hook）──────────────────────────────────────────────────────
 
 function runNotify(args) {
   let input = {};
@@ -193,14 +247,12 @@ function runNotify(args) {
 
   try { fs.writeFileSync(stateFile, token); } catch { process.exit(0); }
 
-  // 传递音效参数给后台发送进程（过滤掉 --debounce 及其值）
   const soundArgs = [];
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--debounce') { i++; continue; }
     soundArgs.push(args[i]);
   }
 
-  // 每个参数单引号包裹，内部单引号转义，防止音效名含特殊字符时 bash 解析错误
   const quotedArgs = soundArgs.map(a => `'${a.replace(/'/g, "'\\''")}'`).join(' ');
 
   const bgScript = [
@@ -216,7 +268,42 @@ function runNotify(args) {
   process.exit(0);
 }
 
-// ─── _send（内部）────────────────────────────────────────────────────────────
+// ─── attention-notify（PreToolUse hook）──────────────────────────────────────
+
+function runAttentionNotify(args) {
+  // 读取 PreToolUse payload（不强制，失败也继续）
+  try {
+    fs.readFileSync('/dev/stdin', 'utf-8');
+  } catch { /* ignore */ }
+
+  // 速率限制：30 秒内只发一次，避免连续工具调用产生噪音
+  const rateFile = path.join(os.tmpdir(), 'claude-notifier-attention-ts');
+  const now = Date.now();
+  try {
+    const last = parseInt(fs.readFileSync(rateFile, 'utf-8').trim());
+    if (!isNaN(last) && now - last < 30000) process.exit(0);
+  } catch { /* 首次 */ }
+  try { fs.writeFileSync(rateFile, String(now)); } catch { /* ignore */ }
+
+  const soundIdx = args.indexOf('--sound');
+  const soundName = soundIdx !== -1 ? args[soundIdx + 1] : null;
+  const isCustomSound = args.includes('--custom-sound');
+
+  try {
+    const notifier = require('node-notifier');
+    notifier.notify({
+      title: '🤖 需要您的操作',
+      message: 'Claude Code 正在等待您的回复',
+      sound: !soundName,
+      wait: false,
+    });
+    if (soundName) playSound(soundName, isCustomSound);
+  } catch { /* ignore */ }
+
+  process.exit(0);
+}
+
+// ─── _send（内部，由 debounce 后台进程调用）──────────────────────────────────
 
 function sendNow(args) {
   const soundIdx = args.indexOf('--sound');
@@ -232,9 +319,7 @@ function sendNow(args) {
       wait: false,
     });
     if (soundName) playSound(soundName, isCustomSound);
-  } catch {
-    // 静默忽略，不影响 Claude 流程
-  }
+  } catch { /* ignore */ }
 
   process.exit(0);
 }
